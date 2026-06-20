@@ -7,6 +7,7 @@
 
 #include <V2_1/SubHal.h>
 
+#include <cstddef>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -31,6 +32,7 @@ class FusionLight {
     void reset();
     void setSourceHandleForType(int32_t sensor_type, int32_t sensor_handle);
     bool isSourceEvent(const Event& event) const;
+    bool isReportEvent(const Event& event) const;
     void updateSample(const Event& event);
     Event createLightEvent(const Event& trigger, int32_t fusion_light_handle) const;
     bool hasSource() const;
@@ -40,6 +42,8 @@ class FusionLight {
 
   private:
     float calculateLux(const Event& trigger) const;
+    float applyMedianEnqueue(float lux, float brightness, bool has_brightness) const;
+    void resetMedianEnqueue() const;
 
     int32_t high_pwm_rgb_handle_ = kInvalidSensorHandle;
     int32_t rear_light_handle_ = kInvalidSensorHandle;
@@ -50,6 +54,9 @@ class FusionLight {
     Event last_high_pwm_rgb_event_{};
     Event last_rear_light_event_{};
     Event last_rgb_event_{};
+    mutable std::vector<float> median_enqueue_values_;
+    mutable std::size_t median_enqueue_head_ = 0;
+    mutable int median_enqueue_size_ = 0;
 };
 
 }  // namespace qsh_wrapper

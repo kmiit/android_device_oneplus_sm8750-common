@@ -68,12 +68,27 @@ struct LinearityFunction {
 
 struct FusionProfile {
     bool loaded = false;
+    bool apollo_brightness_supported = false;
+    bool screen_off_cal_lux_supported = false;
+    bool median_enqueue_supported = false;
+    int apollo_brightness_max = 0;
+    int normal_mode_brightness_max = 0;
     int brightness_max = 4095;
+    int median_enqueue_event_period = 200;
+    int median_enqueue_event_size = 6;
+    int median_enqueue_event_index = 2;
+    int ir_ratio_formula_type = 0;
+    float low_light_accuracy = 0.0f;
     std::string path;
     std::vector<LuxCoeff> lux_coeff_lir;
     std::vector<LuxCoeff> lux_coeff_hir;
     std::vector<LuxCoeff> lux_coeff_super_hir;
+    std::vector<LuxCoeff> lux_coeff_lir_screen_off;
+    std::vector<LuxCoeff> lux_coeff_hir_screen_off;
+    std::vector<LuxCoeff> lux_coeff_super_hir_screen_off;
     std::vector<IrThreshold> ir_thresholds;
+    std::vector<int> c_zero_thresholds;
+    std::vector<BrightnessRange> ir_brightness_ranges;
     std::vector<BrightnessRange> linearity_ranges;
     std::vector<LinearityFunction> linearity;
 };
@@ -87,10 +102,15 @@ struct FusionInput {
     bool has_ir_ratio = false;
     bool has_rgb = false;
     ChannelData channels;
+    int32_t rgb_sensor_type = 0;
 };
 
 inline bool IsFinitePositive(float value) {
     return std::isfinite(value) && value > 0.0f;
+}
+
+inline bool IsFiniteNonNegative(float value) {
+    return std::isfinite(value) && value >= 0.0f;
 }
 
 inline float Clamp(float value, float low, float high) {
@@ -118,6 +138,10 @@ float GetFloat(const Json::Value& value, float default_value = 0.0f) {
 
 int GetInt(const Json::Value& value, int default_value = 0) {
     return value.isInt() || value.isUInt() ? value.asInt() : default_value;
+}
+
+bool GetBool(const Json::Value& value, bool default_value = false) {
+    return value.isBool() ? value.asBool() : default_value;
 }
 
 LuxCoeff ParseCoeff(const Json::Value& value) {
@@ -165,6 +189,25 @@ std::vector<IrThreshold> ParseIrThresholds(const Json::Value& values) {
         return lhs.level < rhs.level;
     });
     return thresholds;
+}
+
+std::vector<int> ParseLevelIntArray(const Json::Value& values, const char* field) {
+    std::vector<int> result;
+    if (!values.isArray()) {
+        return result;
+    }
+
+    for (const auto& value : values) {
+        const auto level = GetInt(value["Level"], static_cast<int>(result.size()));
+        if (level < 0) {
+            continue;
+        }
+        if (static_cast<size_t>(level) >= result.size()) {
+            result.resize(level + 1);
+        }
+        result[level] = GetInt(value[field]);
+    }
+    return result;
 }
 
 std::vector<BrightnessRange> ParseBrightnessRanges(const Json::Value& values) {
@@ -235,11 +278,33 @@ bool ParseProfile(const std::string& path, FusionProfile* profile) {
         return false;
     }
 
+    profile->apollo_brightness_supported =
+            GetBool(root["CommonConfig"]["ApolloBrightnessSupported"]);
+    profile->apollo_brightness_max = GetInt(root["CommonConfig"]["ApolloBrightnessMax"]);
+    profile->normal_mode_brightness_max =
+            GetInt(root["CommonConfig"]["NormalModeBrightnessMax"]);
     profile->brightness_max = GetInt(root["CommonConfig"]["BrightnessMax"], 4095);
+    profile->screen_off_cal_lux_supported =
+            GetBool(root["CommonConfig"]["ScreenOffCalLuxSupported"]);
+    profile->median_enqueue_supported =
+            GetBool(root["CommonConfig"]["MedianEnqueueSupported"]);
+    profile->median_enqueue_event_period =
+            GetInt(root["CommonConfig"]["MedianEnqueueEventPeriod"], 200);
+    profile->median_enqueue_event_size =
+            GetInt(root["CommonConfig"]["MedianEnqueueEventSize"], 6);
+    profile->median_enqueue_event_index =
+            GetInt(root["CommonConfig"]["MedianEnqueueEventIndex"], 2);
+    profile->ir_ratio_formula_type = GetInt(root["CommonConfig"]["IRRatioFormulaType"], 0);
+    profile->low_light_accuracy = GetFloat(root["CommonConfig"]["LowLightAccuracy"]);
     profile->lux_coeff_lir = ParseCoeffArray(root["LuxCoeffLIR"]);
     profile->lux_coeff_hir = ParseCoeffArray(root["LuxCoeffHIR"]);
     profile->lux_coeff_super_hir = ParseCoeffArray(root["LuxCoeffSuperHIR"]);
+    profile->lux_coeff_lir_screen_off = ParseCoeffArray(root["LuxCoeffLirScreenOff"]);
+    profile->lux_coeff_hir_screen_off = ParseCoeffArray(root["LuxCoeffHirScreenOff"]);
+    profile->lux_coeff_super_hir_screen_off = ParseCoeffArray(root["LuxCoeffSuperHirScreenOff"]);
     profile->ir_thresholds = ParseIrThresholds(root["IRThreshold"]);
+    profile->c_zero_thresholds = ParseLevelIntArray(root["CZeroThreshold"], "CZeroMin");
+    profile->ir_brightness_ranges = ParseBrightnessRanges(root["IRBrightness"]);
     profile->linearity_ranges = ParseBrightnessRanges(root["LinearityBrightnessRange"]);
     profile->linearity = ParseLinearity(root["Linearity"]);
     profile->loaded = !profile->lux_coeff_lir.empty() && !profile->ir_thresholds.empty();
@@ -298,17 +363,32 @@ int GetPanelManufactureFromName(const std::string& panel_info) {
     return -1;
 }
 
-int GetDisplayPanelManufactureFromAidl() {
+std::shared_ptr<IDisplayPanelFeature> GetDisplayPanelFeatureService() {
+    static std::mutex mutex;
+    static std::shared_ptr<IDisplayPanelFeature> service;
+
+    std::lock_guard<std::mutex> lock(mutex);
+    if (service != nullptr) {
+        return service;
+    }
+
     const std::string instance = std::string(IDisplayPanelFeature::descriptor) + "/default";
     ndk::SpAIBinder binder(AServiceManager_checkService(instance.c_str()));
     if (binder.get() == nullptr) {
         LOG(WARNING) << "DisplayPanelFeature service is unavailable";
-        return -1;
+        return nullptr;
     }
 
-    const auto service = IDisplayPanelFeature::fromBinder(binder);
+    service = IDisplayPanelFeature::fromBinder(binder);
     if (service == nullptr) {
         LOG(WARNING) << "Failed to create DisplayPanelFeature client";
+    }
+    return service;
+}
+
+int GetDisplayPanelManufactureFromAidl() {
+    const auto service = GetDisplayPanelFeatureService();
+    if (service == nullptr) {
         return -1;
     }
 
@@ -332,6 +412,35 @@ int GetDisplayPanelManufactureFromAidl() {
         LOG(INFO) << "Display panel manufacture=" << manufacture << ", info=" << info.str();
     }
     return manufacture;
+}
+
+bool GetDisplayPanelFeatureValueFromAidl(int32_t feature_id, int32_t* value) {
+    const auto service = GetDisplayPanelFeatureService();
+    if (service == nullptr) {
+        return false;
+    }
+
+    std::vector<int32_t> feature_values;
+    int32_t result = -1;
+    const auto status = service->getDisplayPanelFeatureValue(feature_id, &feature_values, &result);
+    if (!status.isOk() || result != 0 || feature_values.empty()) {
+        LOG(WARNING) << "getDisplayPanelFeatureValue(" << feature_id
+                     << ") failed, status=" << status.getDescription() << ", result=" << result
+                     << ", size=" << feature_values.size();
+        return false;
+    }
+
+    *value = feature_values[0];
+    return true;
+}
+
+bool GetDisplayPanelBrightnessFromAidl(float* brightness) {
+    int32_t value = -1;
+    if (!GetDisplayPanelFeatureValueFromAidl(29, &value) || value < 0) {
+        return false;
+    }
+    *brightness = static_cast<float>(value);
+    return true;
 }
 
 bool LoadProfileForManufacture(int manufacture, int sensor_module, FusionProfile* profile) {
@@ -383,73 +492,144 @@ float Dot(const LuxCoeff& coeff, const ChannelData& data) {
     return data.r * coeff.r + data.g * coeff.g + data.b * coeff.b + data.c * coeff.c;
 }
 
-float Cubic(float x, const std::array<float, 4>& params) {
-    return ((params[0] * x + params[1]) * x + params[2]) * x + params[3];
-}
+int SelectIrLevel(const FusionProfile& profile, float ir_ratio, bool screen_off) {
+    if (profile.ir_thresholds.empty()) {
+        return 0;
+    }
 
-int SelectIrLevel(const FusionProfile& profile, float ir_ratio) {
+    if (screen_off) {
+        if (ir_ratio <= profile.ir_thresholds.front().max) {
+            return profile.ir_thresholds.front().level;
+        }
+        for (size_t i = 1; i < profile.ir_thresholds.size(); ++i) {
+            const auto& threshold = profile.ir_thresholds[i];
+            if (ir_ratio > threshold.min && ir_ratio <= threshold.max) {
+                return threshold.level;
+            }
+        }
+        return profile.ir_thresholds.back().level;
+    }
+
     for (const auto& threshold : profile.ir_thresholds) {
-        if (ir_ratio >= threshold.min && ir_ratio < threshold.max) {
+        if (ir_ratio < threshold.max) {
             return threshold.level;
         }
     }
-    return profile.ir_thresholds.empty() ? 0 : profile.ir_thresholds.back().level;
+    return profile.ir_thresholds.back().level;
 }
 
-int SelectLinearityFunction(const FusionProfile& profile, float brightness) {
-    for (const auto& range : profile.linearity_ranges) {
-        if (brightness >= range.min && brightness < range.max) {
+int SelectBrightnessLevel(const std::vector<BrightnessRange>& ranges, float brightness) {
+    if (ranges.empty()) {
+        return 0;
+    }
+    for (const auto& range : ranges) {
+        if (brightness >= range.min && brightness <= range.max) {
             return range.level;
         }
     }
-    return profile.linearity_ranges.empty() ? -1 : profile.linearity_ranges.back().level;
+    if (brightness < ranges.front().min) {
+        return ranges.front().level;
+    }
+    return ranges.back().level;
 }
 
-const LuxCoeff* SelectLuxCoeff(const FusionProfile& profile, int ir_level) {
+int SelectCZeroLevel(const FusionProfile& profile, float channel_c) {
+    int level = 0;
+    for (size_t i = 0; i < profile.c_zero_thresholds.size(); ++i) {
+        if (channel_c >= profile.c_zero_thresholds[i]) {
+            level = static_cast<int>(i);
+        }
+    }
+    return level;
+}
+
+const LuxCoeff* SelectLuxCoeff(const FusionProfile& profile, int ir_level, int brightness_level,
+                               bool screen_off, int c_zero_level) {
     const std::vector<LuxCoeff>* coeffs = &profile.lux_coeff_lir;
-    if (ir_level == 1) {
-        coeffs = &profile.lux_coeff_hir;
-    } else if (ir_level >= 2) {
-        coeffs = &profile.lux_coeff_super_hir;
+    int index_level = brightness_level;
+    if (screen_off) {
+        index_level = c_zero_level;
+        coeffs = &profile.lux_coeff_lir_screen_off;
+        if (ir_level == 1) {
+            coeffs = &profile.lux_coeff_hir_screen_off;
+        } else if (ir_level >= 2) {
+            coeffs = &profile.lux_coeff_super_hir_screen_off;
+        }
+    }
+    if (coeffs->empty()) {
+        coeffs = &profile.lux_coeff_lir;
+        index_level = brightness_level;
+        if (ir_level == 1) {
+            coeffs = &profile.lux_coeff_hir;
+        } else if (ir_level >= 2) {
+            coeffs = &profile.lux_coeff_super_hir;
+        }
     }
     if (coeffs->empty()) {
         return nullptr;
     }
-    const auto index = std::min<size_t>(std::max(ir_level, 0), coeffs->size() - 1);
+    const auto index = std::min<size_t>(std::max(index_level, 0), coeffs->size() - 1);
     return &(*coeffs)[index];
 }
 
-ChannelData ApplyLinearity(const FusionProfile& profile, const ChannelData& data, float brightness) {
-    const auto function_index = SelectLinearityFunction(profile, brightness);
-    if (function_index < 0 || static_cast<size_t>(function_index) >= profile.linearity.size()) {
-        return data;
+float NormalizeBrightness(const FusionProfile& profile, float brightness) {
+    if (!std::isfinite(brightness)) {
+        return static_cast<float>(profile.brightness_max);
+    }
+    if (brightness <= 0.0f || brightness <= profile.brightness_max) {
+        return ClampNonNegative(brightness);
     }
 
-    const auto& function = profile.linearity[function_index];
-    ChannelData result;
-    result.r = ClampNonNegative(data.r - Cubic(brightness, function.channel_params[0]));
-    result.g = ClampNonNegative(data.g - Cubic(brightness, function.channel_params[1]));
-    result.b = ClampNonNegative(data.b - Cubic(brightness, function.channel_params[2]));
-    result.c = ClampNonNegative(data.c - Cubic(brightness, function.channel_params[3]));
-    return result;
+    if (profile.apollo_brightness_supported && profile.apollo_brightness_max > profile.brightness_max) {
+        return Clamp(brightness * profile.brightness_max / profile.apollo_brightness_max, 0.0f,
+                     static_cast<float>(profile.brightness_max));
+    }
+    return Clamp(brightness, 0.0f, static_cast<float>(profile.brightness_max));
 }
 
-float EstimateIrRatio(const ChannelData& data) {
+bool UsesAbsoluteType0IrRatio(int32_t sensor_type) {
+    switch (sensor_type) {
+        case FusionLight::kTypeHighPwmRgbSensor:
+        case FusionLight::kTypeFusionRgbSensor:
+            return true;
+        default:
+            return false;
+    }
+}
+
+float EstimateIrRatio(const FusionProfile& profile, const FusionInput& input) {
+    const auto& data = input.channels;
     if (!IsFinitePositive(data.c)) {
         return 0.0f;
     }
-    return Clamp((data.c - data.r - data.g - data.b) / data.c, 0.0f, 1.0f);
-}
 
-float FirstPositive(float first, float second) {
-    return IsFinitePositive(first) ? first : second;
+    float ratio = 0.0f;
+    switch (profile.ir_ratio_formula_type) {
+        case 1:
+            ratio = (data.r + data.g + data.b) / (data.c * 3.0f);
+            break;
+        case 2:
+            ratio = 1.0f - (0.299f * data.r + 0.587f * data.g + 0.114f * data.b) / data.c;
+            break;
+        case 3:
+            ratio = IsFinitePositive(data.g) ? data.c / data.g : 0.0f;
+            break;
+        case 0:
+        default:
+            ratio = (data.r + data.g + data.b - data.c) / data.c * -1.0f;
+            if (UsesAbsoluteType0IrRatio(input.rgb_sensor_type)) {
+                ratio = std::fabs(ratio);
+            }
+            break;
+    }
+    return ratio < 0.0f || !std::isfinite(ratio) ? 0.0f : ratio;
 }
 
 float ExtractRawLux(const Event& event) {
     switch (static_cast<int32_t>(event.sensorType)) {
         case FusionLight::kTypeFusionRgbSensor:
             // Stock OplusFusionRGBSensor maps its source lux into data[9].
-            return ClampNonNegative(FirstPositive(event.u.data[9], event.u.data[0]));
+            return ClampNonNegative(event.u.data[9]);
         case FusionLight::kTypeRearLightSensor:
         case FusionLight::kTypeHighPwmRgbSensor:
         default:
@@ -458,6 +638,7 @@ float ExtractRawLux(const Event& event) {
 }
 
 bool FillRgbFromEvent(const Event& event, FusionInput* input) {
+    input->rgb_sensor_type = static_cast<int32_t>(event.sensorType);
     switch (static_cast<int32_t>(event.sensorType)) {
         case FusionLight::kTypeHighPwmRgbSensor:
             input->channels.r = event.u.data[4];
@@ -471,25 +652,29 @@ bool FillRgbFromEvent(const Event& event, FusionInput* input) {
             input->channels.g = event.u.data[2];
             input->channels.b = event.u.data[3];
             input->channels.c = event.u.data[4];
-            input->ir_ratio = event.u.data[8];
+            input->ir_ratio = event.u.data[6];
             break;
         default:
-            input->channels.r = event.u.data[0];
-            input->channels.g = event.u.data[1];
-            input->channels.b = event.u.data[2];
-            input->channels.c = event.u.data[3];
-            input->ir_ratio = event.u.data[4];
-            break;
+            input->has_rgb = false;
+            input->has_ir_ratio = false;
+            return false;
     }
     input->has_rgb = IsFinitePositive(input->channels.r + input->channels.g + input->channels.b +
                                       input->channels.c);
-    input->has_ir_ratio = std::isfinite(input->ir_ratio) && input->ir_ratio >= 0.0f &&
-            input->ir_ratio <= 1.0f;
+    input->has_ir_ratio = std::isfinite(input->ir_ratio) && input->ir_ratio >= 0.0f;
     return input->has_rgb;
 }
 
-float ExtractBrightness(const Event& event) {
-    return event.u.data[3];
+bool ExtractBrightness(const Event& event, float* brightness) {
+    if (static_cast<int32_t>(event.sensorType) != FusionLight::kTypeHighPwmRgbSensor) {
+        return false;
+    }
+    const auto value = event.u.data[3];
+    if (!IsFiniteNonNegative(value)) {
+        return false;
+    }
+    *brightness = value;
+    return true;
 }
 
 float CalculateFusionLux(const FusionInput& input) {
@@ -502,16 +687,28 @@ float CalculateFusionLux(const FusionInput& input) {
         return input.has_raw_lux ? input.raw_lux : ClampNonNegative(input.channels.c);
     }
 
-    const auto brightness = input.has_brightness ? input.brightness : profile.brightness_max;
-    const auto ir_ratio = input.has_ir_ratio ? input.ir_ratio : EstimateIrRatio(input.channels);
-    const auto ir_level = SelectIrLevel(profile, ir_ratio);
-    const auto* coeff = SelectLuxCoeff(profile, ir_level);
+    const auto brightness = NormalizeBrightness(
+            profile, input.has_brightness ? input.brightness : profile.brightness_max);
+    const auto ir_ratio = input.has_ir_ratio ? input.ir_ratio : EstimateIrRatio(profile, input);
+    const bool screen_off = profile.screen_off_cal_lux_supported && input.has_brightness &&
+            input.brightness <= 0.0f;
+    const auto ir_level = SelectIrLevel(profile, ir_ratio, screen_off);
+    const auto& brightness_ranges = !profile.ir_brightness_ranges.empty()
+            ? profile.ir_brightness_ranges
+            : profile.linearity_ranges;
+    const auto brightness_level = SelectBrightnessLevel(brightness_ranges, brightness);
+    const auto c_zero_level = screen_off ? SelectCZeroLevel(profile, input.channels.c) : 0;
+    const auto* coeff = SelectLuxCoeff(profile, ir_level, brightness_level, screen_off, c_zero_level);
     if (coeff == nullptr) {
         return input.has_raw_lux ? input.raw_lux : ClampNonNegative(input.channels.c);
     }
 
-    const auto compensated = ApplyLinearity(profile, input.channels, brightness);
-    const auto lux = ClampNonNegative(Dot(*coeff, compensated));
+    // Stock subtracts panel leakage before calculate_lux_V2_1. Without that source in
+    // the HAL wrapper, use the sensor channels directly.
+    const auto lux = ClampNonNegative(Dot(*coeff, input.channels));
+    if (lux < profile.low_light_accuracy) {
+        return 0.0f;
+    }
     if (IsFinitePositive(lux)) {
         return lux;
     }
@@ -526,6 +723,46 @@ void FusionLight::reset() {
     has_high_pwm_rgb_event_ = false;
     has_rear_light_event_ = false;
     has_rgb_event_ = false;
+    median_enqueue_values_.clear();
+    median_enqueue_head_ = 0;
+    median_enqueue_size_ = 0;
+}
+
+void FusionLight::resetMedianEnqueue() const {
+    median_enqueue_size_ = 0;
+}
+
+float FusionLight::applyMedianEnqueue(float lux, float brightness, bool has_brightness) const {
+    const auto& profile = GetProfile();
+    if (!profile.loaded || !profile.median_enqueue_supported || !has_brightness ||
+        brightness <= 1.0f || lux >= profile.median_enqueue_event_period) {
+        resetMedianEnqueue();
+        return lux;
+    }
+
+    const int queue_size = profile.median_enqueue_event_size;
+    const int queue_index = profile.median_enqueue_event_index;
+    if (queue_size <= queue_index || queue_size > 20 || queue_index < 0) {
+        return lux;
+    }
+
+    if (median_enqueue_values_.size() != static_cast<size_t>(queue_size)) {
+        median_enqueue_values_.assign(queue_size, 0.0f);
+        median_enqueue_head_ = 0;
+        median_enqueue_size_ = 0;
+    }
+
+    if (median_enqueue_size_ == queue_size) {
+        median_enqueue_values_[median_enqueue_head_] = lux;
+        median_enqueue_head_ = (median_enqueue_head_ + 1) % queue_size;
+        auto sorted = median_enqueue_values_;
+        std::sort(sorted.begin(), sorted.end());
+        return sorted[queue_index];
+    }
+
+    median_enqueue_values_[median_enqueue_size_] = lux;
+    ++median_enqueue_size_;
+    return lux;
 }
 
 void FusionLight::setSourceHandleForType(int32_t sensor_type, int32_t sensor_handle) {
@@ -552,6 +789,10 @@ bool FusionLight::isSourceEvent(const Event& event) const {
             return event.sensorHandle == fusion_rgb_handle_;
     }
     return false;
+}
+
+bool FusionLight::isReportEvent(const Event& event) const {
+    return event.sensorHandle == primarySourceHandle();
 }
 
 void FusionLight::updateSample(const Event& event) {
@@ -601,7 +842,8 @@ std::vector<int32_t> FusionLight::sourceHandles() const {
     if (rear_light_handle_ != kInvalidSensorHandle) {
         handles.push_back(rear_light_handle_);
     }
-    if (handles.empty() && fusion_rgb_handle_ != kInvalidSensorHandle) {
+    if (high_pwm_rgb_handle_ == kInvalidSensorHandle &&
+        fusion_rgb_handle_ != kInvalidSensorHandle) {
         handles.push_back(fusion_rgb_handle_);
     }
     return handles;
@@ -632,16 +874,19 @@ float FusionLight::calculateLux(const Event& trigger) const {
 
     // Stock layouts seen in libsensorserviceextimpl.so:
     // - high_pwm_rgb: data[4..7] = R/G/B/C.
-    // - virtual qti.sensor.rgb: data[1..4] = R/G/B/C and data[9] = lux.
+    // - virtual qti.sensor.rgb: data[1..4] = R/G/B/C, data[6] = IR ratio, data[9] = lux.
     FillRgbFromEvent(*rgbEvent, &input);
 
-    input.brightness = ExtractBrightness(*rgbEvent);
-    if (!IsFinitePositive(input.brightness)) {
-        input.brightness = ExtractBrightness(*rawEvent);
+    input.has_brightness = ExtractBrightness(*rgbEvent, &input.brightness);
+    if (!input.has_brightness) {
+        input.has_brightness = ExtractBrightness(*rawEvent, &input.brightness);
     }
-    input.has_brightness = IsFinitePositive(input.brightness);
+    if (!input.has_brightness) {
+        input.has_brightness = GetDisplayPanelBrightnessFromAidl(&input.brightness);
+    }
 
-    return CalculateFusionLux(input);
+    const auto lux = CalculateFusionLux(input);
+    return applyMedianEnqueue(lux, input.brightness, input.has_brightness);
 }
 
 }  // namespace qsh_wrapper

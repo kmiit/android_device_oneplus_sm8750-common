@@ -157,8 +157,7 @@ Return<void> SensorsSubHal::getSensorsList_2_1(ISensors::getSensorsList_2_1_cb _
             fusion_light_.setSourceHandleForType(static_cast<int32_t>(rear_light_it->type),
                                                 rear_light_it->sensorHandle);
         }
-        if (high_pwm_it == _hidl_out_list.end() && rear_light_it == _hidl_out_list.end() &&
-            fusion_rgb_it != _hidl_out_list.end()) {
+        if (high_pwm_it == _hidl_out_list.end() && fusion_rgb_it != _hidl_out_list.end()) {
             fusion_light_.setSourceHandleForType(static_cast<int32_t>(fusion_rgb_it->type),
                                                 fusion_rgb_it->sensorHandle);
         }
@@ -233,7 +232,9 @@ void SensorsSubHal::postEvents(const std::vector<Event>& events, ScopedWakelock 
         if (fusion_light_handle_ != FusionLight::kInvalidSensorHandle &&
             fusion_light_.isSourceEvent(e)) {
             fusion_light_.updateSample(e);
-            wrapped_events.emplace_back(fusion_light_.createLightEvent(e, fusion_light_handle_));
+            if (fusion_light_.isReportEvent(e)) {
+                wrapped_events.emplace_back(fusion_light_.createLightEvent(e, fusion_light_handle_));
+            }
         }
     }
     if (wrapped_events.empty()) {
