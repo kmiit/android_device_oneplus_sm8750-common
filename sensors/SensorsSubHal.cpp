@@ -5,9 +5,12 @@
 
 #include "SensorsSubHal.h"
 
+#include <algorithm>
 #include <android-base/logging.h>
 #include <dlfcn.h>
 #include <hardware/sensors.h>
+
+#include <vector>
 
 using ::android::hardware::sensors::V2_0::implementation::ScopedWakelock;
 using ::android::hardware::sensors::V2_1::implementation::ISensorsSubHal;
@@ -22,7 +25,6 @@ namespace qsh_wrapper {
 
 namespace {
 constexpr auto kLibName = "sensors.qsh.so";
-constexpr auto kTypeUnderScreenRgbSensor = 33171070;
 
 // This is larger than any sensor handle returned by the HAL
 constexpr auto kWrappedSensorHandleBase = 0x10000;
@@ -36,6 +38,27 @@ inline int32_t FromWrappedHandle(int32_t sensor_handle) {
 inline int32_t ToWrappedHandle(int32_t sensor_handle) {
     return IsWrappedHandle(sensor_handle) ? sensor_handle
                                           : sensor_handle + kWrappedSensorHandleBase;
+}
+
+template <typename Operation>
+Return<Result> ApplyToFusionSources(const std::vector<int32_t>& source_handles,
+                                    Operation operation) {
+    if (source_handles.empty()) {
+        return Result::BAD_VALUE;
+    }
+
+    Result result = Result::OK;
+    for (const auto source_handle : source_handles) {
+        auto ret = operation(source_handle);
+        if (!ret.isOk()) {
+            return ret;
+        }
+        Result source_result = ret.withDefault(Result::BAD_VALUE);
+        if (source_result != Result::OK && result == Result::OK) {
+            result = source_result;
+        }
+    }
+    return result;
 }
 };  // anonymous namespace
 
@@ -58,16 +81,31 @@ Return<Result> SensorsSubHal::setOperationMode(OperationMode mode) {
 }
 
 Return<Result> SensorsSubHal::activate(int32_t sensor_handle, bool enabled) {
+    if (sensor_handle == fusion_light_handle_) {
+        return ApplyToFusionSources(fusion_light_.sourceHandles(), [&](int32_t source_handle) {
+            return impl_->activate(source_handle, enabled);
+        });
+    }
     return impl_->activate(FromWrappedHandle(sensor_handle), enabled);
 }
 
 Return<Result> SensorsSubHal::batch(int32_t sensor_handle, int64_t sampling_period_ns,
                                     int64_t max_report_latency_ns) {
+    if (sensor_handle == fusion_light_handle_) {
+        return ApplyToFusionSources(fusion_light_.sourceHandles(), [&](int32_t source_handle) {
+            return impl_->batch(source_handle, sampling_period_ns, max_report_latency_ns);
+        });
+    }
     return impl_->batch(FromWrappedHandle(sensor_handle), sampling_period_ns,
                         max_report_latency_ns);
 }
 
 Return<Result> SensorsSubHal::flush(int32_t sensor_handle) {
+    if (sensor_handle == fusion_light_handle_) {
+        return ApplyToFusionSources(fusion_light_.sourceHandles(), [&](int32_t source_handle) {
+            return impl_->flush(source_handle);
+        });
+    }
     return impl_->flush(FromWrappedHandle(sensor_handle));
 }
 
@@ -89,23 +127,57 @@ Return<void> SensorsSubHal::configDirectReport(int32_t sensor_handle, int32_t ch
 
 Return<void> SensorsSubHal::getSensorsList_2_1(ISensors::getSensorsList_2_1_cb _hidl_cb) {
     return impl_->getSensorsList_2_1([&](const auto& _hidl_out_list) {
-        auto it = std::find_if(_hidl_out_list.begin(), _hidl_out_list.end(), [](auto&& v) {
-            return static_cast<int32_t>(v.type) == kTypeUnderScreenRgbSensor;
-        });
-        if (it != _hidl_out_list.end()) {
+        auto findSensorByType = [&](int32_t type) {
+            return std::find_if(_hidl_out_list.begin(), _hidl_out_list.end(), [=](auto&& v) {
+                return static_cast<int32_t>(v.type) == type;
+            });
+        };
+
+        handle_type_.clear();
+        fusion_light_.reset();
+        fusion_light_handle_ = FusionLight::kInvalidSensorHandle;
+
+        auto high_pwm_it = findSensorByType(FusionLight::kTypeHighPwmRgbSensor);
+        auto rear_light_it = findSensorByType(FusionLight::kTypeRearLightSensor);
+        auto fusion_rgb_it = findSensorByType(FusionLight::kTypeFusionRgbSensor);
+
+        auto it = high_pwm_it;
+        if (it == _hidl_out_list.end()) {
+            it = rear_light_it;
+        }
+        if (it == _hidl_out_list.end()) {
+            it = fusion_rgb_it;
+        }
+
+        if (high_pwm_it != _hidl_out_list.end()) {
+            fusion_light_.setSourceHandleForType(static_cast<int32_t>(high_pwm_it->type),
+                                                high_pwm_it->sensorHandle);
+        }
+        if (rear_light_it != _hidl_out_list.end()) {
+            fusion_light_.setSourceHandleForType(static_cast<int32_t>(rear_light_it->type),
+                                                rear_light_it->sensorHandle);
+        }
+        if (high_pwm_it == _hidl_out_list.end() && rear_light_it == _hidl_out_list.end() &&
+            fusion_rgb_it != _hidl_out_list.end()) {
+            fusion_light_.setSourceHandleForType(static_cast<int32_t>(fusion_rgb_it->type),
+                                                fusion_rgb_it->sensorHandle);
+        }
+
+        if (it != _hidl_out_list.end() && fusion_light_.hasSource()) {
             auto last = _hidl_out_list.size();
             auto sensors = hidl_vec<SensorInfo>(last + 1);
             std::copy(_hidl_out_list.begin(), _hidl_out_list.end(), sensors.begin());
 
-            handle_type_[it->sensorHandle] = it->type;
-
             sensors[last] = *it;
             sensors[last].sensorHandle = ToWrappedHandle(sensors[last].sensorHandle);
-            sensors[last].name = "Aliased Light Sensor";
+            sensors[last].name = "OPLUS Fusion Light Sensor";
             sensors[last].type = SensorType::LIGHT;
             sensors[last].typeAsString = "";  // Empty string is valid for known types
 
-            LOG(INFO) << "High PWM Light sensor found, aliasing it to Light sensor";
+            fusion_light_handle_ = sensors[last].sensorHandle;
+            handle_type_[fusion_light_handle_] = it->type;
+
+            LOG(INFO) << "Fusion light source found: " << fusion_light_.sourceSummary();
             _hidl_cb(sensors);
         } else {
             _hidl_cb(_hidl_out_list);
@@ -115,9 +187,14 @@ Return<void> SensorsSubHal::getSensorsList_2_1(ISensors::getSensorsList_2_1_cb _
 
 Return<Result> SensorsSubHal::injectSensorData_2_1(const Event& event) {
     if (IsWrappedHandle(event.sensorHandle)) {
+        auto it = handle_type_.find(event.sensorHandle);
+        if (it == handle_type_.end()) {
+            return Result::BAD_VALUE;
+        }
+
         auto event_copy = event;
         event_copy.sensorHandle = FromWrappedHandle(event.sensorHandle);
-        event_copy.sensorType = handle_type_[event.sensorHandle];
+        event_copy.sensorType = it->second;
         return impl_->injectSensorData_2_1(event_copy);
     }
     return impl_->injectSensorData_2_1(event);
@@ -153,11 +230,10 @@ Return<void> SensorsSubHal::onDynamicSensorsConnected_2_1(
 void SensorsSubHal::postEvents(const std::vector<Event>& events, ScopedWakelock wakelock) {
     std::vector<Event> wrapped_events;
     for (auto&& e : events) {
-        if (static_cast<int32_t>(e.sensorType) == kTypeUnderScreenRgbSensor) {
-            auto event_copy = e;
-            event_copy.sensorHandle = ToWrappedHandle(e.sensorHandle);
-            event_copy.sensorType = SensorType::LIGHT;
-            wrapped_events.emplace_back(std::move(event_copy));
+        if (fusion_light_handle_ != FusionLight::kInvalidSensorHandle &&
+            fusion_light_.isSourceEvent(e)) {
+            fusion_light_.updateSample(e);
+            wrapped_events.emplace_back(fusion_light_.createLightEvent(e, fusion_light_handle_));
         }
     }
     if (wrapped_events.empty()) {

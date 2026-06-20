@@ -5,7 +5,11 @@
 
 #pragma once
 
+#include "SensorsFusion.h"
+
 #include <V2_1/SubHal.h>
+
+#include <unordered_map>
 
 namespace android {
 namespace hardware {
@@ -62,6 +66,8 @@ class SensorsSubHal : public ISensorsSubHal, public IHalProxyCallback {
     sp<IHalProxyCallback> hal_proxy_callback_;
 
     std::unordered_map<int32_t, SensorType> handle_type_;
+    FusionLight fusion_light_;
+    int32_t fusion_light_handle_ = FusionLight::kInvalidSensorHandle;
 };
 
 }  // namespace qsh_wrapper
