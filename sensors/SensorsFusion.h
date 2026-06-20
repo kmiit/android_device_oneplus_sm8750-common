@@ -37,7 +37,8 @@ class FusionLight {
     Event createLightEvent(const Event& trigger, int32_t fusion_light_handle) const;
     bool hasSource() const;
     int32_t primarySourceHandle() const;
-    std::vector<int32_t> sourceHandles() const;
+    std::size_t sourceHandleCount() const;
+    int32_t sourceHandleAt(std::size_t index) const;
     std::string sourceSummary() const;
 
   private:

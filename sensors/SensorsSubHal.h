@@ -9,8 +9,6 @@
 
 #include <V2_1/SubHal.h>
 
-#include <unordered_map>
-
 namespace android {
 namespace hardware {
 namespace sensors {
@@ -65,7 +63,7 @@ class SensorsSubHal : public ISensorsSubHal, public IHalProxyCallback {
     V2_1::implementation::ISensorsSubHal* impl_;
     sp<IHalProxyCallback> hal_proxy_callback_;
 
-    std::unordered_map<int32_t, SensorType> handle_type_;
+    SensorType fusion_light_source_type_ = SensorType::LIGHT;
     FusionLight fusion_light_;
     int32_t fusion_light_handle_ = FusionLight::kInvalidSensorHandle;
 };

@@ -10,12 +10,10 @@
 #include <android/binder_manager.h>
 #include <android-base/file.h>
 #include <android-base/logging.h>
-#include <android-base/properties.h>
 #include <json/json.h>
 
 #include <algorithm>
 #include <cctype>
-#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <limits>
@@ -61,18 +59,12 @@ struct BrightnessRange {
     int max = 4095;
 };
 
-struct LinearityFunction {
-    int function = 0;
-    std::array<std::array<float, 4>, 4> channel_params{};
-};
-
 struct FusionProfile {
     bool loaded = false;
     bool apollo_brightness_supported = false;
     bool screen_off_cal_lux_supported = false;
     bool median_enqueue_supported = false;
     int apollo_brightness_max = 0;
-    int normal_mode_brightness_max = 0;
     int brightness_max = 4095;
     int median_enqueue_event_period = 200;
     int median_enqueue_event_size = 6;
@@ -90,7 +82,6 @@ struct FusionProfile {
     std::vector<int> c_zero_thresholds;
     std::vector<BrightnessRange> ir_brightness_ranges;
     std::vector<BrightnessRange> linearity_ranges;
-    std::vector<LinearityFunction> linearity;
 };
 
 struct FusionInput {
@@ -229,40 +220,6 @@ std::vector<BrightnessRange> ParseBrightnessRanges(const Json::Value& values) {
     return ranges;
 }
 
-std::vector<LinearityFunction> ParseLinearity(const Json::Value& values) {
-    std::vector<LinearityFunction> functions;
-    if (!values.isArray()) {
-        return functions;
-    }
-
-    for (const auto& value : values) {
-        LinearityFunction function;
-        function.function = GetInt(value["Function"], static_cast<int>(functions.size()));
-        const auto& params = value["LinearityParameter"];
-        if (params.isArray()) {
-            for (const auto& channel : params) {
-                const auto index = GetInt(channel["Channel"], -1);
-                if (index < 0 || index >= static_cast<int>(function.channel_params.size())) {
-                    continue;
-                }
-                function.channel_params[index] = {
-                        GetFloat(channel["Parameter0"]),
-                        GetFloat(channel["Parameter1"]),
-                        GetFloat(channel["Parameter2"]),
-                        GetFloat(channel["Parameter3"]),
-                };
-            }
-        }
-        if (function.function >= 0) {
-            if (static_cast<size_t>(function.function) >= functions.size()) {
-                functions.resize(function.function + 1);
-            }
-            functions[function.function] = function;
-        }
-    }
-    return functions;
-}
-
 bool ParseProfile(const std::string& path, FusionProfile* profile) {
     std::string content;
     if (!android::base::ReadFileToString(path, &content)) {
@@ -281,8 +238,6 @@ bool ParseProfile(const std::string& path, FusionProfile* profile) {
     profile->apollo_brightness_supported =
             GetBool(root["CommonConfig"]["ApolloBrightnessSupported"]);
     profile->apollo_brightness_max = GetInt(root["CommonConfig"]["ApolloBrightnessMax"]);
-    profile->normal_mode_brightness_max =
-            GetInt(root["CommonConfig"]["NormalModeBrightnessMax"]);
     profile->brightness_max = GetInt(root["CommonConfig"]["BrightnessMax"], 4095);
     profile->screen_off_cal_lux_supported =
             GetBool(root["CommonConfig"]["ScreenOffCalLuxSupported"]);
@@ -306,7 +261,6 @@ bool ParseProfile(const std::string& path, FusionProfile* profile) {
     profile->c_zero_thresholds = ParseLevelIntArray(root["CZeroThreshold"], "CZeroMin");
     profile->ir_brightness_ranges = ParseBrightnessRanges(root["IRBrightness"]);
     profile->linearity_ranges = ParseBrightnessRanges(root["LinearityBrightnessRange"]);
-    profile->linearity = ParseLinearity(root["Linearity"]);
     profile->loaded = !profile->lux_coeff_lir.empty() && !profile->ir_thresholds.empty();
     profile->path = path;
     return profile->loaded;
@@ -444,19 +398,12 @@ bool GetDisplayPanelBrightnessFromAidl(float* brightness) {
 }
 
 bool LoadProfileForManufacture(int manufacture, int sensor_module, FusionProfile* profile) {
-    const std::array<std::string, 4> roots = {
-            "/odm/etc/fusionlight_profile/",
-            "/vendor/etc/fusionlight_profile/",
-            "/system/etc/fusionlight_profile/",
-            "/etc/fusionlight_profile/",
-    };
+    const std::string root = "/odm/etc/fusionlight_profile/";
     const auto filename = "fusionlight_Main_" + std::to_string(manufacture) + "_" +
             std::to_string(sensor_module) + ".json";
-    for (const auto& root : roots) {
-        if (ParseProfile(root + filename, profile)) {
-            LOG(INFO) << "Loaded fusion light profile " << profile->path;
-            return true;
-        }
+    if (ParseProfile(root + filename, profile)) {
+        LOG(INFO) << "Loaded fusion light profile " << profile->path;
+        return true;
     }
     return false;
 }
@@ -465,23 +412,16 @@ const FusionProfile& GetProfile() {
     static FusionProfile profile;
     static std::once_flag load_once;
     std::call_once(load_once, [] {
-        const int sensor_module = android::base::GetIntProperty(
-                "persist.vendor.sensors.fusionlight.sensor_module", 3);
-        const int override_manufacture = android::base::GetIntProperty(
-                "persist.vendor.sensors.fusionlight.lcd_manufacture", -1);
-        if (override_manufacture >= 0 &&
-            LoadProfileForManufacture(override_manufacture, sensor_module, &profile)) {
-            return;
-        }
+        constexpr int kSensorModule = 3;
 
         const int display_manufacture = GetDisplayPanelManufactureFromAidl();
         if (display_manufacture >= 0 &&
-            LoadProfileForManufacture(display_manufacture, sensor_module, &profile)) {
+            LoadProfileForManufacture(display_manufacture, kSensorModule, &profile)) {
             return;
         }
 
-        if (!LoadProfileForManufacture(0, sensor_module, &profile) &&
-            !LoadProfileForManufacture(1, sensor_module, &profile)) {
+        if (!LoadProfileForManufacture(0, kSensorModule, &profile) &&
+            !LoadProfileForManufacture(1, kSensorModule, &profile)) {
             LOG(WARNING) << "No fusion light profile found; falling back to raw lux";
         }
     });
@@ -580,7 +520,8 @@ float NormalizeBrightness(const FusionProfile& profile, float brightness) {
         return ClampNonNegative(brightness);
     }
 
-    if (profile.apollo_brightness_supported && profile.apollo_brightness_max > profile.brightness_max) {
+    if (profile.apollo_brightness_supported &&
+        profile.apollo_brightness_max > profile.brightness_max) {
         return Clamp(brightness * profile.brightness_max / profile.apollo_brightness_max, 0.0f,
                      static_cast<float>(profile.brightness_max));
     }
@@ -698,7 +639,8 @@ float CalculateFusionLux(const FusionInput& input) {
             : profile.linearity_ranges;
     const auto brightness_level = SelectBrightnessLevel(brightness_ranges, brightness);
     const auto c_zero_level = screen_off ? SelectCZeroLevel(profile, input.channels.c) : 0;
-    const auto* coeff = SelectLuxCoeff(profile, ir_level, brightness_level, screen_off, c_zero_level);
+    const auto* coeff =
+            SelectLuxCoeff(profile, ir_level, brightness_level, screen_off, c_zero_level);
     if (coeff == nullptr) {
         return input.has_raw_lux ? input.raw_lux : ClampNonNegative(input.channels.c);
     }
@@ -834,19 +776,39 @@ int32_t FusionLight::primarySourceHandle() const {
     return fusion_rgb_handle_;
 }
 
-std::vector<int32_t> FusionLight::sourceHandles() const {
-    std::vector<int32_t> handles;
+std::size_t FusionLight::sourceHandleCount() const {
+    std::size_t count = 0;
     if (high_pwm_rgb_handle_ != kInvalidSensorHandle) {
-        handles.push_back(high_pwm_rgb_handle_);
+        ++count;
     }
     if (rear_light_handle_ != kInvalidSensorHandle) {
-        handles.push_back(rear_light_handle_);
+        ++count;
     }
     if (high_pwm_rgb_handle_ == kInvalidSensorHandle &&
         fusion_rgb_handle_ != kInvalidSensorHandle) {
-        handles.push_back(fusion_rgb_handle_);
+        ++count;
     }
-    return handles;
+    return count;
+}
+
+int32_t FusionLight::sourceHandleAt(std::size_t index) const {
+    if (high_pwm_rgb_handle_ != kInvalidSensorHandle) {
+        if (index == 0) {
+            return high_pwm_rgb_handle_;
+        }
+        --index;
+    }
+    if (rear_light_handle_ != kInvalidSensorHandle) {
+        if (index == 0) {
+            return rear_light_handle_;
+        }
+        --index;
+    }
+    if (high_pwm_rgb_handle_ == kInvalidSensorHandle &&
+        fusion_rgb_handle_ != kInvalidSensorHandle && index == 0) {
+        return fusion_rgb_handle_;
+    }
+    return kInvalidSensorHandle;
 }
 
 std::string FusionLight::sourceSummary() const {
@@ -857,16 +819,23 @@ std::string FusionLight::sourceSummary() const {
 }
 
 float FusionLight::calculateLux(const Event& trigger) const {
-    const Event* rawEvent = has_rear_light_event_ ? &last_rear_light_event_
-                                                  : (has_rgb_event_ ? &last_rgb_event_
-                                                                    : (has_high_pwm_rgb_event_
-                                                                               ? &last_high_pwm_rgb_event_
-                                                                               : &trigger));
-    const Event* rgbEvent = has_high_pwm_rgb_event_ ? &last_high_pwm_rgb_event_
-                                                    : (has_rgb_event_ ? &last_rgb_event_
-                                                                      : (has_rear_light_event_
-                                                                                 ? &last_rear_light_event_
-                                                                                 : &trigger));
+    const Event* rawEvent = &trigger;
+    if (has_rear_light_event_) {
+        rawEvent = &last_rear_light_event_;
+    } else if (has_rgb_event_) {
+        rawEvent = &last_rgb_event_;
+    } else if (has_high_pwm_rgb_event_) {
+        rawEvent = &last_high_pwm_rgb_event_;
+    }
+
+    const Event* rgbEvent = &trigger;
+    if (has_high_pwm_rgb_event_) {
+        rgbEvent = &last_high_pwm_rgb_event_;
+    } else if (has_rgb_event_) {
+        rgbEvent = &last_rgb_event_;
+    } else if (has_rear_light_event_) {
+        rgbEvent = &last_rear_light_event_;
+    }
 
     FusionInput input;
     input.raw_lux = ExtractRawLux(*rawEvent);

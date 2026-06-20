@@ -10,8 +10,6 @@
 #include <dlfcn.h>
 #include <hardware/sensors.h>
 
-#include <vector>
-
 using ::android::hardware::sensors::V2_0::implementation::ScopedWakelock;
 using ::android::hardware::sensors::V2_1::implementation::ISensorsSubHal;
 
@@ -28,7 +26,7 @@ constexpr auto kLibName = "sensors.qsh.so";
 
 // This is larger than any sensor handle returned by the HAL
 constexpr auto kWrappedSensorHandleBase = 0x10000;
-inline int32_t IsWrappedHandle(int32_t sensor_handle) {
+inline bool IsWrappedHandle(int32_t sensor_handle) {
     return sensor_handle >= kWrappedSensorHandleBase;
 }
 inline int32_t FromWrappedHandle(int32_t sensor_handle) {
@@ -41,15 +39,15 @@ inline int32_t ToWrappedHandle(int32_t sensor_handle) {
 }
 
 template <typename Operation>
-Return<Result> ApplyToFusionSources(const std::vector<int32_t>& source_handles,
-                                    Operation operation) {
-    if (source_handles.empty()) {
+Return<Result> ApplyToFusionSources(const FusionLight& fusion_light, Operation operation) {
+    const auto source_count = fusion_light.sourceHandleCount();
+    if (source_count == 0) {
         return Result::BAD_VALUE;
     }
 
     Result result = Result::OK;
-    for (const auto source_handle : source_handles) {
-        auto ret = operation(source_handle);
+    for (std::size_t i = 0; i < source_count; ++i) {
+        auto ret = operation(fusion_light.sourceHandleAt(i));
         if (!ret.isOk()) {
             return ret;
         }
@@ -82,7 +80,7 @@ Return<Result> SensorsSubHal::setOperationMode(OperationMode mode) {
 
 Return<Result> SensorsSubHal::activate(int32_t sensor_handle, bool enabled) {
     if (sensor_handle == fusion_light_handle_) {
-        return ApplyToFusionSources(fusion_light_.sourceHandles(), [&](int32_t source_handle) {
+        return ApplyToFusionSources(fusion_light_, [&](int32_t source_handle) {
             return impl_->activate(source_handle, enabled);
         });
     }
@@ -92,7 +90,7 @@ Return<Result> SensorsSubHal::activate(int32_t sensor_handle, bool enabled) {
 Return<Result> SensorsSubHal::batch(int32_t sensor_handle, int64_t sampling_period_ns,
                                     int64_t max_report_latency_ns) {
     if (sensor_handle == fusion_light_handle_) {
-        return ApplyToFusionSources(fusion_light_.sourceHandles(), [&](int32_t source_handle) {
+        return ApplyToFusionSources(fusion_light_, [&](int32_t source_handle) {
             return impl_->batch(source_handle, sampling_period_ns, max_report_latency_ns);
         });
     }
@@ -102,7 +100,7 @@ Return<Result> SensorsSubHal::batch(int32_t sensor_handle, int64_t sampling_peri
 
 Return<Result> SensorsSubHal::flush(int32_t sensor_handle) {
     if (sensor_handle == fusion_light_handle_) {
-        return ApplyToFusionSources(fusion_light_.sourceHandles(), [&](int32_t source_handle) {
+        return ApplyToFusionSources(fusion_light_, [&](int32_t source_handle) {
             return impl_->flush(source_handle);
         });
     }
@@ -133,9 +131,9 @@ Return<void> SensorsSubHal::getSensorsList_2_1(ISensors::getSensorsList_2_1_cb _
             });
         };
 
-        handle_type_.clear();
         fusion_light_.reset();
         fusion_light_handle_ = FusionLight::kInvalidSensorHandle;
+        fusion_light_source_type_ = SensorType::LIGHT;
 
         auto high_pwm_it = findSensorByType(FusionLight::kTypeHighPwmRgbSensor);
         auto rear_light_it = findSensorByType(FusionLight::kTypeRearLightSensor);
@@ -174,7 +172,7 @@ Return<void> SensorsSubHal::getSensorsList_2_1(ISensors::getSensorsList_2_1_cb _
             sensors[last].typeAsString = "";  // Empty string is valid for known types
 
             fusion_light_handle_ = sensors[last].sensorHandle;
-            handle_type_[fusion_light_handle_] = it->type;
+            fusion_light_source_type_ = it->type;
 
             LOG(INFO) << "Fusion light source found: " << fusion_light_.sourceSummary();
             _hidl_cb(sensors);
@@ -185,16 +183,14 @@ Return<void> SensorsSubHal::getSensorsList_2_1(ISensors::getSensorsList_2_1_cb _
 }
 
 Return<Result> SensorsSubHal::injectSensorData_2_1(const Event& event) {
-    if (IsWrappedHandle(event.sensorHandle)) {
-        auto it = handle_type_.find(event.sensorHandle);
-        if (it == handle_type_.end()) {
-            return Result::BAD_VALUE;
-        }
-
+    if (event.sensorHandle == fusion_light_handle_) {
         auto event_copy = event;
         event_copy.sensorHandle = FromWrappedHandle(event.sensorHandle);
-        event_copy.sensorType = it->second;
+        event_copy.sensorType = fusion_light_source_type_;
         return impl_->injectSensorData_2_1(event_copy);
+    }
+    if (IsWrappedHandle(event.sensorHandle)) {
+        return Result::BAD_VALUE;
     }
     return impl_->injectSensorData_2_1(event);
 }
@@ -233,7 +229,8 @@ void SensorsSubHal::postEvents(const std::vector<Event>& events, ScopedWakelock 
             fusion_light_.isSourceEvent(e)) {
             fusion_light_.updateSample(e);
             if (fusion_light_.isReportEvent(e)) {
-                wrapped_events.emplace_back(fusion_light_.createLightEvent(e, fusion_light_handle_));
+                wrapped_events.emplace_back(
+                        fusion_light_.createLightEvent(e, fusion_light_handle_));
             }
         }
     }
