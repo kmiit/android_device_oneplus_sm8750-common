@@ -432,26 +432,17 @@ float Dot(const LuxCoeff& coeff, const ChannelData& data) {
     return data.r * coeff.r + data.g * coeff.g + data.b * coeff.b + data.c * coeff.c;
 }
 
-int SelectIrLevel(const FusionProfile& profile, float ir_ratio, bool screen_off) {
+int SelectIrLevel(const FusionProfile& profile, float ir_ratio, bool /*screen_off*/) {
     if (profile.ir_thresholds.empty()) {
         return 0;
     }
 
-    if (screen_off) {
-        if (ir_ratio <= profile.ir_thresholds.front().max) {
-            return profile.ir_thresholds.front().level;
-        }
-        for (size_t i = 1; i < profile.ir_thresholds.size(); ++i) {
-            const auto& threshold = profile.ir_thresholds[i];
-            if (ir_ratio > threshold.min && ir_ratio <= threshold.max) {
-                return threshold.level;
-            }
-        }
-        return profile.ir_thresholds.back().level;
+    if (ir_ratio <= profile.ir_thresholds.front().max) {
+        return profile.ir_thresholds.front().level;
     }
-
-    for (const auto& threshold : profile.ir_thresholds) {
-        if (ir_ratio < threshold.max) {
+    for (size_t i = 1; i < profile.ir_thresholds.size(); ++i) {
+        const auto& threshold = profile.ir_thresholds[i];
+        if (ir_ratio > threshold.min && ir_ratio <= threshold.max) {
             return threshold.level;
         }
     }
@@ -547,17 +538,17 @@ float EstimateIrRatio(const FusionProfile& profile, const FusionInput& input) {
     float ratio = 0.0f;
     switch (profile.ir_ratio_formula_type) {
         case 1:
-            ratio = (data.r + data.g + data.b) / (data.c * 3.0f);
+            ratio = 1.0f - (data.r + data.g + data.b) / (data.c * 1.27f);
             break;
         case 2:
-            ratio = 1.0f - (0.299f * data.r + 0.587f * data.g + 0.114f * data.b) / data.c;
+            ratio = 1.0f - (0.4379f * data.r + 0.243f * data.g + 0.2435f * data.b) / data.c;
             break;
         case 3:
             ratio = IsFinitePositive(data.g) ? data.c / data.g : 0.0f;
             break;
         case 0:
         default:
-            ratio = (data.r + data.g + data.b - data.c) / data.c * -1.0f;
+            ratio = (data.r + data.g + data.b - data.c) / data.c * 0.5f;
             if (UsesAbsoluteType0IrRatio(input.rgb_sensor_type)) {
                 ratio = std::fabs(ratio);
             }
